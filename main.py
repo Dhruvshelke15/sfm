@@ -4,42 +4,36 @@ import numpy as np
 
 from sfm.features import FeatureExtractor, FeatureMatcher
 from sfm.geometry import GeometricVerifier, TwoViewReconstructor
-from sfm.utils import (
-    load_images,
-    load_intrinsics,
-    visualize_keypoints,
-    visualize_matches,
-    visualize_point_cloud,
-    print_summary,
-)
+from sfm.reconstruction import IncrementalReconstructor
+from sfm.bundle_adjustment import BundleAdjuster
+from sfm.utils import load_images, load_intrinsics, visualize_keypoints, visualize_matches, visualize_point_cloud, print_summary
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="SfM Pipeline")
-    parser.add_argument("--images",     type=str, required=True,  help="Path to image directory.")
-    parser.add_argument("--intrinsics", type=str, default=None,   help="Path to K.txt intrinsics file (3x3).")
-    parser.add_argument("--method",     type=str, default="sift", choices=["sift", "orb"])
-    parser.add_argument("--n_features", type=int, default=8000)
-    parser.add_argument("--ratio_thresh", type=float, default=0.75)
-    parser.add_argument("--min_matches", type=int, default=20)
-    parser.add_argument("--ransac_thresh", type=float, default=1.0, help="RANSAC reprojection threshold (px).")
-    parser.add_argument("--max",        type=int, default=None, dest="max_images")
-    parser.add_argument("--visualize",  action="store_true")
-    parser.add_argument("--output",     type=str, default="output")
-    return parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--images",        type=str, required=True)
+    p.add_argument("--intrinsics",    type=str, default=None)
+    p.add_argument("--method",        type=str, default="sift", choices=["sift", "orb"])
+    p.add_argument("--n_features",    type=int, default=8000)
+    p.add_argument("--ratio_thresh",  type=float, default=0.75)
+    p.add_argument("--min_matches",   type=int, default=20)
+    p.add_argument("--ransac_thresh", type=float, default=1.0)
+    p.add_argument("--max",           type=int, default=None, dest="max_images")
+    p.add_argument("--visualize",     action="store_true")
+    p.add_argument("--bundle_adjust", action="store_true")
+    p.add_argument("--ba_max_points", type=int, default=1000)
+    p.add_argument("--pnp_reproj",   type=float, default=8.0, help="PnP RANSAC reprojection threshold (default 8.0)")
+    p.add_argument("--tri_reproj",   type=float, default=8.0, help="Triangulation max reprojection error (default 8.0)")
+    p.add_argument("--stall",        type=int, default=15, help="Max stall iterations before stopping (default 15)")
+    p.add_argument("--output",       type=str, default="output")
+    return p.parse_args()
 
 
-def build_default_K(images: list) -> np.ndarray:
-    
+def build_default_K(images):
     h, w = images[0].shape[:2]
     f = max(h, w)
-    K = np.array([
-        [f,   0,  w / 2],
-        [0,   f,  h / 2],
-        [0,   0,  1    ],
-    ], dtype=np.float64)
-    print(f"\n[INFO] No intrinsics file provided. Using estimated K:")
-    print(K)
+    K = np.array([[f, 0, w/2], [0, f, h/2], [0, 0, 1]], dtype=np.float64)
+    print(f"\n[INFO] No intrinsics provided. Using estimated K:\n{K}")
     return K
 
 
@@ -47,14 +41,12 @@ def main():
     args = parse_args()
     os.makedirs(args.output, exist_ok=True)
 
-    # 1. Load images
     print("\n=== Stage 1: Loading Images ===")
     images, paths = load_images(args.images, max_images=args.max_images)
     if len(images) < 2:
-        print("Need at least 2 images. Exiting.")
+        print("Need at least 2 images.")
         return
 
-    # 2. Feature extraction
     print(f"\n=== Stage 2: Feature Extraction ({args.method.upper()}) ===")
     extractor = FeatureExtractor(method=args.method, n_features=args.n_features)
     all_features = extractor.extract_from_image_list(images, paths)
@@ -67,13 +59,8 @@ def main():
             show=False,
         )
 
-    # 3. Feature matching
     print(f"\n=== Stage 3: Feature Matching ===")
-    matcher = FeatureMatcher(
-        method=args.method,
-        ratio_thresh=args.ratio_thresh,
-        min_matches=args.min_matches,
-    )
+    matcher = FeatureMatcher(method=args.method, ratio_thresh=args.ratio_thresh, min_matches=args.min_matches)
     match_results = matcher.match_all_pairs(all_features)
 
     if args.visualize and match_results:
@@ -90,70 +77,80 @@ def main():
 
     print_summary(all_features, match_results)
 
-    # 4. Geometric verification
-    print(f"\n=== Stage 4: Geometric Verification (RANSAC) ===")
+    print(f"\n=== Stage 4: Geometric Verification ===")
     verifier = GeometricVerifier(ransac_threshold=args.ransac_thresh)
     verified_matches = verifier.verify_all(match_results)
-
     if not verified_matches:
-        print("No pairs survived geometric verification. Exiting.")
+        print("No pairs survived verification.")
         return
 
-    # 5. Two-view reconstruction (initial pair)
     print(f"\n=== Stage 5: Two-View Reconstruction ===")
     K = load_intrinsics(args.intrinsics) if args.intrinsics else build_default_K(images)
-
-    reconstructor = TwoViewReconstructor(K)
-    candidates = reconstructor.rank_initial_pairs(verified_matches)
+    two_view = TwoViewReconstructor(K)
+    candidates = two_view.rank_initial_pairs(verified_matches)
 
     if not candidates:
-        print("No valid initial pair candidates found. Exiting.")
+        print("No valid initial pairs.")
         return
 
-    print(f"\nTop-10 initial pair candidates:")
+    print("\nTop-10 candidates:")
     for (ci, cj), score, h_ratio in candidates[:10]:
-        print(
-            f"  Pair ({ci:>2},{cj:>2})  "
-            f"inliers={verified_matches[(ci,cj)].num_inliers:>4}  "
-            f"homography_ratio={h_ratio:.2f}  score={score:.1f}"
-        )
+        print(f"  ({ci:>2},{cj:>2})  inliers={verified_matches[(ci,cj)].num_inliers:>4}  h_ratio={h_ratio:.2f}  score={score:.1f}")
 
-    # Try candidates in ranked order until one succeeds
-    result = None
-    best_pair = None
-    for (ci, cj), score, h_ratio in candidates[:10]:
-        print(f"\n  Trying pair ({ci},{cj})...")
-        r = reconstructor.reconstruct(verified_matches[(ci, cj)])
+    init_result, seed_pair = None, None
+    for (ci, cj), _, _ in candidates[:10]:
+        r = two_view.reconstruct(verified_matches[(ci, cj)])
         if r is not None:
-            result = r
-            best_pair = (ci, cj)
-            print(f"  Success!")
+            init_result, seed_pair = r, (ci, cj)
+            print(f"\nSeed pair ({ci},{cj}): {len(r.points_3d)} pts, reproj={r.reprojection_error:.4f} px")
             break
-        print(f"  Failed, trying next candidate...")
 
-    if result is None:
-        print("\nAll candidate pairs failed reconstruction. Exiting.")
+    if init_result is None:
+        print("All seed pairs failed.")
         return
 
-    i, j = best_pair
-    print(f"\nTwo-view reconstruction complete:")
-    print(f"  Pair:               ({i}, {j})")
-    print(f"  Triangulated pts:   {len(result.points_3d)}")
-    print(f"  Mean reproj error:  {result.reprojection_error:.4f} px")
-    print(f"  Rotation (R):\n{result.R}")
-    print(f"  Translation (t):    {result.t.ravel()}")
+    print(f"\n=== Stage 6: Incremental Reconstruction ===")
+    inc = IncrementalReconstructor(K, pnp_reprojection=args.pnp_reproj, tri_max_reproj=args.tri_reproj, max_stall=args.stall)
+    inc_result = inc.run(init_result, all_features, verified_matches, images=images)
+
+    print(f"\nRegistered: {len(inc_result.registered_images)}/{len(images)}")
+    print(f"Total points: {len(inc_result.points_3d)}")
+
+    if args.bundle_adjust:
+        print(f"\n=== Stage 7: Bundle Adjustment ===")
+        ba = BundleAdjuster(K)
+        ba_result = ba.run(inc_result, all_features, max_points=args.ba_max_points)
+        final_pts = ba_result.points_3d
+        final_poses = ba_result.camera_poses
+    else:
+        final_pts = inc_result.points_3d
+        final_poses = inc_result.camera_poses
 
     if args.visualize:
+        cam_centers = [(-p["R"].T @ p["t"]).ravel() for p in final_poses.values()]
         visualize_point_cloud(
-            result.points_3d,
-            camera_centers=[
-                np.zeros(3),
-                (-result.R.T @ result.t).ravel(),
-            ],
-            title=f"Initial Point Cloud -- Pair ({i},{j})",
-            save_path=os.path.join(args.output, f"point_cloud_{i}_{j}.png"),
+            final_pts,
+            colors=inc_result.point_colors if len(inc_result.point_colors) > 0 else None,
+            camera_centers=cam_centers,
+            title=f"Full Reconstruction -- {len(inc_result.registered_images)} cameras, {len(final_pts)} points",
+            save_path=os.path.join(args.output, "point_cloud_final.png"),
             show=True,
         )
+
+    summary_path = os.path.join(args.output, "results_summary.txt")
+    with open(summary_path, "w") as f:
+        f.write(f"Dataset:           {args.images}\n")
+        f.write(f"Method:            {args.method.upper()}\n")
+        f.write(f"Total images:      {len(images)}\n")
+        f.write(f"Registered images: {len(inc_result.registered_images)}\n")
+        f.write(f"Total 3D points:   {len(final_pts)}\n")
+        f.write(f"Seed pair:         {seed_pair}\n")
+        f.write(f"Seed reproj error: {init_result.reprojection_error:.4f} px\n")
+        if args.bundle_adjust:
+            f.write(f"BA error before:   {ba_result.reprojection_error_before:.4f} px\n")
+            f.write(f"BA error after:    {ba_result.reprojection_error_after:.4f} px\n")
+
+    print(f"\nResults saved to {summary_path}")
 
 
 if __name__ == "__main__":

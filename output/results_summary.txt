@@ -1,0 +1,9 @@
+Dataset:           data/dino_ring
+Method:            SIFT
+Total images:      48
+Registered images: 48
+Total 3D points:   3028
+Seed pair:         (25, 27)
+Seed reproj error: 0.2245 px
+BA error before:   0.9820 px
+BA error after:    0.2002 px
