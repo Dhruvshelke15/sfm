@@ -6,7 +6,11 @@ from sfm.features import FeatureExtractor, FeatureMatcher
 from sfm.geometry import GeometricVerifier, TwoViewReconstructor
 from sfm.reconstruction import IncrementalReconstructor
 from sfm.bundle_adjustment import BundleAdjuster
-from sfm.utils import load_images, load_intrinsics, visualize_keypoints, visualize_matches, visualize_point_cloud, print_summary
+from sfm.utils import (
+    load_images, load_intrinsics, filter_outliers,
+    visualize_keypoints, visualize_matches, visualize_point_cloud,
+    plot_reprojection_histogram, print_summary,
+)
 
 
 def parse_args():
@@ -18,14 +22,14 @@ def parse_args():
     p.add_argument("--ratio_thresh",  type=float, default=0.75)
     p.add_argument("--min_matches",   type=int, default=20)
     p.add_argument("--ransac_thresh", type=float, default=1.0)
+    p.add_argument("--pnp_reproj",    type=float, default=8.0)
+    p.add_argument("--tri_reproj",    type=float, default=8.0)
+    p.add_argument("--stall",         type=int, default=15)
     p.add_argument("--max",           type=int, default=None, dest="max_images")
     p.add_argument("--visualize",     action="store_true")
     p.add_argument("--bundle_adjust", action="store_true")
-    p.add_argument("--ba_max_points", type=int, default=1000)
-    p.add_argument("--pnp_reproj",   type=float, default=8.0, help="PnP RANSAC reprojection threshold (default 8.0)")
-    p.add_argument("--tri_reproj",   type=float, default=8.0, help="Triangulation max reprojection error (default 8.0)")
-    p.add_argument("--stall",        type=int, default=15, help="Max stall iterations before stopping (default 15)")
-    p.add_argument("--output",       type=str, default="output")
+    p.add_argument("--ba_max_points", type=int, default=3000)
+    p.add_argument("--output",        type=str, default="output")
     return p.parse_args()
 
 
@@ -35,6 +39,32 @@ def build_default_K(images):
     K = np.array([[f, 0, w/2], [0, f, h/2], [0, 0, 1]], dtype=np.float64)
     print(f"\n[INFO] No intrinsics provided. Using estimated K:\n{K}")
     return K
+
+
+def compute_reprojection_errors(points_3d, point_obs, camera_poses, all_features):
+    """Compute per-point mean reprojection error. Filters points with error > 50px as bad kp lookups."""
+    errors = []
+    for pt3d, obs_list in zip(points_3d, point_obs):
+        ph = np.append(pt3d, 1.0)
+        pt_errors = []
+        for img_id, kp_idx in obs_list:
+            if img_id not in camera_poses:
+                continue
+            kps = all_features[img_id].keypoints
+            if kp_idx >= len(kps):
+                continue
+            P = camera_poses[img_id]["P"]
+            q = P @ ph
+            if q[2] <= 0:
+                continue
+            proj = q[:2] / q[2]
+            obs = np.array(kps[kp_idx].pt)
+            err = np.linalg.norm(proj - obs)
+            if err < 50.0:  # filter clearly wrong kp index lookups
+                pt_errors.append(err)
+        if pt_errors:
+            errors.append(np.mean(pt_errors))
+    return errors
 
 
 def main():
@@ -88,7 +118,6 @@ def main():
     K = load_intrinsics(args.intrinsics) if args.intrinsics else build_default_K(images)
     two_view = TwoViewReconstructor(K)
     candidates = two_view.rank_initial_pairs(verified_matches)
-
     if not candidates:
         print("No valid initial pairs.")
         return
@@ -122,15 +151,33 @@ def main():
         ba_result = ba.run(inc_result, all_features, max_points=args.ba_max_points)
         final_pts = ba_result.points_3d
         final_poses = ba_result.camera_poses
+        print(f"  Error before BA: {ba_result.reprojection_error_before:.4f} px")
+        print(f"  Error after  BA: {ba_result.reprojection_error_after:.4f} px")
     else:
         final_pts = inc_result.points_3d
         final_poses = inc_result.camera_poses
 
+    # Compute and plot reprojection errors
+    print(f"\nComputing reprojection errors...")
+    errors = compute_reprojection_errors(final_pts, inc_result.point_obs, final_poses, all_features)
+    if errors:
+        print(f"  Mean:   {np.mean(errors):.4f} px")
+        print(f"  Median: {np.median(errors):.4f} px")
+        print(f"  <1px:   {(np.array(errors) < 1.0).mean()*100:.1f}%")
+        print(f"  <2px:   {(np.array(errors) < 2.0).mean()*100:.1f}%")
+        if args.visualize:
+            plot_reprojection_histogram(
+                errors,
+                save_path=os.path.join(args.output, "reprojection_histogram.png"),
+                show=False,
+            )
+
     if args.visualize:
         cam_centers = [(-p["R"].T @ p["t"]).ravel() for p in final_poses.values()]
+        colors = inc_result.point_colors if len(inc_result.point_colors) > 0 else None
         visualize_point_cloud(
             final_pts,
-            colors=inc_result.point_colors if len(inc_result.point_colors) > 0 else None,
+            colors=colors,
             camera_centers=cam_centers,
             title=f"Full Reconstruction -- {len(inc_result.registered_images)} cameras, {len(final_pts)} points",
             save_path=os.path.join(args.output, "point_cloud_final.png"),
@@ -146,6 +193,11 @@ def main():
         f.write(f"Total 3D points:   {len(final_pts)}\n")
         f.write(f"Seed pair:         {seed_pair}\n")
         f.write(f"Seed reproj error: {init_result.reprojection_error:.4f} px\n")
+        if errors:
+            f.write(f"Mean reproj error: {np.mean(errors):.4f} px\n")
+            f.write(f"Median reproj error: {np.median(errors):.4f} px\n")
+            f.write(f"Points < 1px error: {(np.array(errors) < 1.0).mean()*100:.1f}%\n")
+            f.write(f"Points < 2px error: {(np.array(errors) < 2.0).mean()*100:.1f}%\n")
         if args.bundle_adjust:
             f.write(f"BA error before:   {ba_result.reprojection_error_before:.4f} px\n")
             f.write(f"BA error after:    {ba_result.reprojection_error_after:.4f} px\n")
